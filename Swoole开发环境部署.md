@@ -41,9 +41,56 @@
 
     - 安装dnmp
     ```cmd
-        git clone https://github.com/yeszao/dnmp.git dnmp
+        git clone https://github.com/shisiying/dnmp-swoole.git
     ```
     
+    以上我的仓库主要是对[dnmp](https://github.com/yeszao/dnmp)做了简化
+    
+    - 快速使用
+    
+  在开发的时候，我们可能经常使用docker exec -it切换到容器中，把常用的做成命令别名是个省事的方法。
+  
+  打开~/.bashrc,(mac上的是.zshrc)加上：
+  
+  alias dnginx='docker exec -it dnmp-swoole_nginx_1 /bin/sh'
+  alias dphp72='docker exec -it dnmp-swoole_php72_1 /bin/sh'
+  alias dphp56='docker exec -it dnmp-swoole_php56_1 /bin/sh'
+  alias dmysql='docker exec -it dnmp-swoole_mysql_1 /bin/bash'
+  alias dredis='docker exec -it dnmp-swoole_redis_1 /bin/sh'
+
+  然后直接在dnmp-swoole目录执行docker-compose up -d,这里默认你已经安装了docker以及docker-compose
+
+   - 测试
+   
+   如果你配置好了alias dphp72的命令，那么就可以使用下列命令测试swoole有没有安装好
+   
+   启动服务端
+   ```cmd
+        $ dhphp72
+        $ cd swoole-project/
+        $ php swoole-server.php
+   ``` 
+   
+   新建终端
+   启动客户端
+   ```cmd
+       $ dhphp72
+       $ cd swoole-project/
+       $ php swoole-client.php
+   ```
+   
+   我们可以在客户端看到：服务器给你发送消息了：hello world，说明环境已经部署成功
+   
+   
+- PhpStorm配置ide，swoole提示工具
+    
+  安装好之后呢。如果你还需要对你想对你的编辑器，比如：phpstrom 对swoole的代码提示功能，就可以下载帮助文件：https://github.com/swoole/ide-helper
+  
+  点击setting选择languages 点击+号添加我们下载的文件
+
+    
+    
+ 
     
     
 
