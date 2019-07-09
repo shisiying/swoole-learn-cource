@@ -8,6 +8,7 @@
 >此教程将会尽我所能的参考各种资料写出细节，太细节的需要自行翻书，教程中会稍作引导，同时也会写点demo代码帮助理解（同时也是监督我自己
 
 - [Swoole开发环境部署](Swoole开发环境部署.md)
-
+- [Swoole的server跟client](Swoole的server跟client.md)
+- [Swoole进程结构](Swoole进程结构.md)
 
 
