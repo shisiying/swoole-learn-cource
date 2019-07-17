@@ -155,3 +155,254 @@ onPipeMessage  当工作进程收到由 sendMessage 发送的管道消息时会�
 ![WeChatdb8757139c4b07dd63ce57ac012da180.png](https://i.loli.net/2019/07/10/5d2593dd2f0ea65645.png)
 
 
+## 守护进程，信号和平滑重启
+
+
+### 信号和平滑重启
+
+经过上述代码的编写，我们可以知道，每次修改完代码之后，我们都需要Ctrl+C，然后重新执行代码，这样修改的才会直接生效，这也是Swoole之所以性能卓越对比于传统的php-fpm模式，是因为Swoole减少了每一次请求加载PHP文件以及初始化的开销。但是这种优势也导致开发者无法像过去一样，修改PHP文件，重新请求，就能获取到新代码的运行结果（具体看另外的课程文档）。如果需要新代码开始执行，往往需要先关闭服务器然后重启，这样才能使得新文件被加载进内存运行，这样很明显不能满足开发者的需求。幸运的是，Swoole 提供了这样的功能，但是我们有更友好的方式：我们先了解下信号处理。
+
+在swoole中，我们可以向主进程发送各种不同的信号，主进程根据接收到的信号类型做出不同的处理。比如下面这几个
+
+- 1、kill -SIGTERM|-15 master_pid  终止Swoole程序,一种优雅的终止信号，会待进程执行完当前程序之后中断，而不是直接干掉进程
+- 2、kill -USR1|-10  master_pid  重启所有的Worker进程
+- 3、kill -USR2|-12  master_pid   重启所有的Task Worker进程 
+
+当USR1信号被发送给Master进程后，Master进程会将同样的信号通过Manager进程转发Worker进程，收到此信号的Worker进程会在处理完正在执行的逻辑之后，释放进程内存，关闭自己，然后由Manager进程重启一个新的Worker进程。新的Worker进程会占用新的内存空间。
+
+那么什么是信号呢？
+
+信号是由用户、系统或者进程发送给目标进程的倍息，以通知目标进程某个状态的改变 或系统异常。Linux信号可由如下条件产生：
+
+- 对于前台进程，用户可以通过输人特殊的终端字符来给它发送信号。比如输入Ctrl+C 通常会给进程发送一个中断信号。
+- 系统异常。比如浮点异常和非法内存段访问。
+- 系统状态变化。比如alarm定时器到期将引起SIGALRM倍号。
+- 运行kill命令或调用kill函数。
+
+
+### 热重启
+
+不影响用户的情况下重启服务，更新内存中已经加载的php程序代码，从而达到对业务逻辑的更新。swoole为我们提供了平滑重启机制，我们只需要向swoole_server的主进程发送特定的信号，即可完成对server的重启
+
+注意事项：
+
+1、更新仅仅只是针对worker进程，也就是写在master进程跟manger进程当中更新代码并不生效，也就是说只有在onWorkerStart回调之后加载的文件，重启才有意义。在Worker进程启动之前就已经加载到内存中的文件，如果想让它重新生效，只能关闭server再重启
+
+2、直接写在worker代码当中的逻辑是不会生效的，就算发送了信号也不会，需要通过include方式引入相关的业务逻辑代码才会生效
+
+
+### 利用inotify实现热重启
+
+在传统的nginx+php-fpm模式中，每次请求结束后资源都会被释放，下次有新的请求会重新加载文件，所以只要更新了代码即可马上生效，但是在cli命令行模式开发中，开启的php进程服务一般都是守护进程，代码只在开启时进行加载，就算代码有更新也不会重新加载，直到进程结束都还是最开始加载的代码，导致每次更新代码都要重启php服务，这样的体验是非常不好的，我们可以借用swoole+Inotify来解决这个问题
+
+Inotify介绍
+
+inotify是Linux内核提供的一组系统调用，它可以监控文件系统操作，比如文件或者目录的创建、读取、写入、权限修改和删除等。
+
+inotify使用也很简单，使用inotify_init创建一个句柄，然后通过inotify_add_watch/inotify_rm_watch增加/删除对文件和目录的监听。
+
+PHP中提供了inotify扩展，支持了inotify系统调用。inotify本身也是一个文件描述符，可以加入到事件循环中，配合使用swoole扩展，就可以异步非阻塞地实时监听文件/目录变化
+
+Inotif安装
+
+可以使用 pecl install inotify
+
+在swoole中使用需要注意的事项：
+
+1、OnWorkerStart之后加载的代码都在各自进程中，OnWorkerStart之前加载的代码属于共享内存。
+
+2、可以将公用的，不易变的php文件放置到onWorkerStart之前。这样虽然不能重载入代码，但所有worker是共享的，不需要额外的内存来保存这些数据。onWorkerStart之后的代码每个worker都需要在内存中保存一份
+
+Inotif代码示例：
+
+```php
+    <?php
+    
+    class Worker
+    {
+        //监听事件连接
+        public $onConnect;
+        //监听事件关闭
+        public $onClose;
+        public $onMessage;
+        protected $socket;
+        //进程数
+        protected $allSocket;
+        protected $workerNum = 4;
+        public $addr;
+        protected $woker_pids; //子进程
+        protected $master_pid;
+    
+        public function __construct($socket_address)
+        {
+            $this->addr = $socket_address;
+            $this->master_pid = posix_getpid();
+        }
+    
+        /**
+         * 文件监视，自动重启
+         */
+        protected function watch()
+        {
+            $init = inotify_init();
+            $files = get_included_files();
+    
+            foreach ($files as $file) {
+                inotify_add_watch($init,$file,IN_MODIFY);//监视修改相关的文件
+            }
+    
+            //监听
+            swoole_event_add($init,function ($fd){
+                $events = inotify_read($fd);
+                if (!empty($events)) {
+                    posix_kill($this->master_pid,SIGUSR1);
+                }
+            });
+        }
+    
+        public function fork($workerNum)
+        {
+            //创建多进程
+            for ($i=0;$i<$workerNum;$i++){
+    
+                $test=include 'index.php';
+                var_dump($test);
+                $pid=pcntl_fork(); //创建成功会返回子进程id
+    
+                if($pid<0){
+                    exit('创建失败');
+                }else if($pid>0){
+                    $this->woker_pids[] = $pid;
+                    //父进程空间，返回子进程id
+                }else{ //返回为0子进程空间
+                    $this->accept();
+                    exit;
+                }
+            }
+        }
+    
+        public function accept()
+        {
+            $opts = array(
+                'socket' => array(
+                    'backlog' =>10240, //成功建立socket连接的等待个数
+                ),
+            );
+    
+            $context = stream_context_create($opts);
+            //开启多端口监听,并且实现负载均衡
+            stream_context_set_option($context,'socket','so_reuseport',1);
+            stream_context_set_option($context,'socket','so_reuseaddr',1);
+            $this->socket=stream_socket_server($this->addr,$errno,$errstr,STREAM_SERVER_BIND|STREAM_SERVER_LISTEN,$context);
+    
+            //设置监听服务端事件
+            swoole_event_add($this->socket, function ($fd) {
+                $clientSocket = stream_socket_accept($fd);
+    
+                if (!empty($clientSocket) && is_callable($this->onConnect)) {
+                    //触发连接事件的回调
+                    call_user_func($this->onConnect, $clientSocket);
+                }
+    
+                //设置监听客户端事件
+                swoole_event_add($clientSocket, function ($fd) {
+                    //读取客户端数据
+                    $buffer = fread($fd, 655535);
+    
+                    //如果数据为空或者为false，不是资源类型
+                    if (empty($buffer)) {
+                        if (feof($fd) || !is_resource($fd)) {
+                            fclose($fd);
+                        }
+                    }
+    
+                    //正常读取数据触发onmesseage回调，响应内容
+                    if (!empty($buffer) && is_callable($this->onMessage)) {
+                        call_user_func($this->onMessage, $fd, $buffer);
+                    }
+                });
+            });
+        }
+    
+        /**
+         * 重启进程
+         */
+        public function reload()
+        {
+            foreach ($this->woker_pids as $pid_key => $pid) {
+                posix_kill($pid,SIGKILL);//结束进程
+                unset($this->woker_pids[$pid_key]);
+                $this->fork(1);
+            }
+        }
+    
+        /**
+         * 信号捕获
+         * 监视worker进程，拉起进程
+         */
+        public function monitorWorkers()
+        {
+            //注册信号事件回调,是不会自动执行的
+            pcntl_signal(SIGUSR1,[$this,'signalHandler'],false);//重启woker进程信号
+    
+            $status = 0;
+    
+            while(1) {
+                // 发现信号队列,一旦发现有信号就会触发进程绑定事件回调
+                pcntl_signal_dispatch();
+                //主进程处理子进程
+                $pid = pcntl_wait($status);
+                //进程重启的过程当中会有新的信号过来,如果没有调用pcntl_signal_dispatch,信号不会被处理
+                pcntl_signal_dispatch();
+    
+            }
+        }
+    
+        public function signalHandler($sigo)
+        {
+            switch ($sigo) {
+                case SIGUSR1:
+                    $this->reload();
+                    echo "收到信号";
+                    break;
+            }
+    
+        }
+    
+    
+        public function start()
+        {
+            $this->watch();
+            $this->fork($this->workerNum);
+            $this->monitorWorkers();
+        }
+    }
+    
+    $worker = new Worker('tcp://0.0.0.0:9080');
+    
+    $worker->onConnect = function ($fd){
+        echo '连接事件触发',(int)$fd,PHP_EOL;
+    };
+    
+    $worker->onMessage = function ($conn,$message){
+    
+        $content="hello world!";
+        $http_resonse = "HTTP/1.1 200 OK\r\n";
+        $http_resonse .= "Content-Type: text/html;charset=UTF-8\r\n";
+        $http_resonse .= "Connection: keep-alive\r\n"; //连接保持
+        $http_resonse .= "Server: php socket server\r\n";
+        $http_resonse .= "Content-length: ".strlen($content)."\r\n\r\n";
+        $http_resonse .= $content;
+        fwrite($conn, $http_resonse);
+    };
+    
+    
+    $worker->start();
+```
+
+在swoole中集成Inotif实现热重启
+
+代码示例如下:
+
+待补充
+
